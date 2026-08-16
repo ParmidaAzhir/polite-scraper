@@ -4,6 +4,7 @@ from pathlib import Path
 from urllib.parse import urljoin, urlparse
 import json
 import time
+import sys
 
 import requests
 from bs4 import BeautifulSoup
@@ -271,7 +272,7 @@ def validate_records(raw_records):
 
     return valid_records, errors
 
-def main():
+def main(test_failure=False):
     start_time = utc_now()
     start_clock = time.perf_counter()
 
@@ -281,15 +282,15 @@ def main():
     }
 
     books = discover_books(stats)
-
     # Deliberately broken URL for the Stage 5 failure test
-    books.append({
-        "product_url": (
-            "https://books.toscrape.com/catalogue/"
-            "this-book-does-not-exist-999999/index.html"
-        ),
-        "source_page": START_URL,
-    })
+    if test_failure:
+        books.append({
+            "product_url": (
+                "https://books.toscrape.com/catalogue/"
+                "this-book-does-not-exist-999999/index.html"
+            ),
+            "source_page": START_URL,
+        })
 
     raw_records = []
     fetch_errors = []
@@ -365,6 +366,7 @@ def main():
     print(f"invalid_records={len(validation_errors)}")
     print(f"failed_pages={len(fetch_errors)}")
     print(f"books_saved={len(valid_records)}")
-    
+
 if __name__ == "__main__":
-    main()
+    test_failure = "--test-failure" in sys.argv
+    main(test_failure=test_failure)
