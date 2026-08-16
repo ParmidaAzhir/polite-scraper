@@ -1,6 +1,7 @@
+from pydantic import BaseModel, Field, HttpUrl, ValidationError
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
-from datetime import datetime, timezone
 import json
 import time
 
@@ -17,12 +18,26 @@ HEADERS = {
 TIMEOUT = 10
 DELAY = 0.5
 
+class BookRecord(BaseModel):
+    title: str
+    product_url: HttpUrl
+    price_text: str
+    price_gbp: float = Field(ge=0)
+    availability_text: str
+    rating_text: str
+    description: str | None = None
+    source_page: HttpUrl
+    fetched_at: datetime
 
 def utc_now():
     return datetime.now(timezone.utc).isoformat(
         timespec="seconds"
     ).replace("+00:00", "Z")
 
+def normalize_price(price_text):
+    return float(
+        price_text.replace("£", "").strip()
+    )
 
 def fetch_page(url, cache_path):
     cache_path = Path(cache_path)
@@ -148,6 +163,8 @@ def extract_book(book):
         "p.price_color"
     ).get_text(strip=True)
 
+    price_gbp = normalize_price(price_text)
+
     availability = product.select_one(
         "p.instock.availability"
     )
@@ -179,6 +196,7 @@ def extract_book(book):
         "title": title,
         "product_url": product_url,
         "price_text": price_text,
+        "price_gbp": price_gbp,
         "availability_text": availability_text,
         "rating_text": rating_text,
         "description": description,
@@ -186,6 +204,25 @@ def extract_book(book):
         "fetched_at": fetched_at,
     }
 
+def validate_records(raw_records):
+    valid_records = []
+    errors = []
+
+    for record in raw_records:
+        try:
+            validated = BookRecord.model_validate(record)
+
+            valid_records.append(
+                validated.model_dump(mode="json")
+            )
+
+        except ValidationError as error:
+            errors.append({
+                "record": record,
+                "reason": error.errors(),
+            })
+
+    return valid_records, errors
 
 def main():
     books = discover_books()
@@ -196,15 +233,35 @@ def main():
         record = extract_book(book)
         raw_records.append(record)
 
-    print(json.dumps(
-        raw_records[0],
-        indent=2,
-        ensure_ascii=False
-    ))
+    valid_records, errors = validate_records(raw_records)
+
+    output_dir = Path("output")
+    output_dir.mkdir(exist_ok=True)
+
+    books_file = output_dir / "books.json"
+    errors_file = output_dir / "errors.json"
+
+    books_file.write_text(
+        json.dumps(
+            valid_records,
+            indent=2,
+            ensure_ascii=False
+        ),
+        encoding="utf-8"
+    )
+
+    errors_file.write_text(
+        json.dumps(
+            errors,
+            indent=2,
+            ensure_ascii=False
+        ),
+        encoding="utf-8"
+    )
 
     print()
-    print(f"detail_pages={len(raw_records)}")
-
-
+    print(f"valid_records={len(valid_records)}")
+    print(f"invalid_records={len(errors)}")
+    print(f"books_saved={len(valid_records)}")
 if __name__ == "__main__":
     main()
