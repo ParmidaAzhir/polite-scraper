@@ -17,6 +17,7 @@ HEADERS = {
 
 TIMEOUT = 10
 DELAY = 0.5
+RETRY_DELAY = 1
 
 class BookRecord(BaseModel):
     title: str
@@ -39,7 +40,7 @@ def normalize_price(price_text):
         price_text.replace("£", "").strip()
     )
 
-def fetch_page(url, cache_path):
+def fetch_page(url, cache_path, stats):
     cache_path = Path(cache_path)
 
     if cache_path.exists():
@@ -50,36 +51,77 @@ def fetch_page(url, cache_path):
             tz=timezone.utc
         ).isoformat(timespec="seconds").replace("+00:00", "Z")
 
+        stats["cache_hits"] += 1
+
         print(f"CACHE HIT: {cache_path.name}")
         return html, fetched_at
 
-    print(f"FETCH: {url}")
+    for attempt in range(2):
+        try:
+            print(f"FETCH: {url}")
 
-    time.sleep(DELAY)
+            time.sleep(DELAY)
 
-    response = requests.get(
-        url,
-        headers=HEADERS,
-        timeout=TIMEOUT,
-    )
+            response = requests.get(
+                url,
+                headers=HEADERS,
+                timeout=TIMEOUT,
+            )
 
-    if response.status_code != 200:
-        raise RuntimeError(
-            f"Failed to fetch {url}: HTTP {response.status_code}"
-        )
+            if response.status_code == 200:
+                response.encoding = "utf-8"
+                html = response.text
 
-    response.encoding = "utf-8"
-    html = response.text
+                cache_path.parent.mkdir(
+                    parents=True,
+                    exist_ok=True
+                )
 
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-    cache_path.write_text(html, encoding="utf-8")
+                cache_path.write_text(
+                    html,
+                    encoding="utf-8"
+                )
 
-    print(f"response_size={len(html.encode('utf-8'))} bytes")
+                stats["pages_fetched"] += 1
 
-    return html, utc_now()
+                print(
+                    f"response_size="
+                    f"{len(html.encode('utf-8'))} bytes"
+                )
+
+                return html, utc_now()
+
+            if response.status_code in (403, 404):
+                raise RuntimeError(
+                    f"HTTP {response.status_code}: {url}"
+                )
+
+            if 500 <= response.status_code < 600:
+                if attempt == 0:
+                    print("Temporary server error — retrying once")
+                    time.sleep(RETRY_DELAY)
+                    continue
+
+                raise RuntimeError(
+                    f"HTTP {response.status_code}: {url}"
+                )
+
+            raise RuntimeError(
+                f"HTTP {response.status_code}: {url}"
+            )
+
+        except requests.exceptions.Timeout:
+            if attempt == 0:
+                print("Timeout — retrying once")
+                time.sleep(RETRY_DELAY)
+                continue
+
+            raise RuntimeError(
+                f"Timeout fetching: {url}"
+            )
 
 
-def discover_books():
+def discover_books(stats):
     current_url = START_URL
     catalogue_pages = 0
     discovered_books = []
@@ -92,7 +134,11 @@ def discover_books():
             / f"catalogue-page-{catalogue_pages}.html"
         )
 
-        html, _ = fetch_page(current_url, cache_path)
+        html, _ = fetch_page(
+            current_url,
+            cache_path,
+            stats
+        )
 
         soup = BeautifulSoup(html, "html.parser")
 
@@ -135,7 +181,7 @@ def discover_books():
     return books
 
 
-def extract_book(book):
+def extract_book(book, stats):
     product_url = book["product_url"]
     source_page = book["source_page"]
 
@@ -150,7 +196,8 @@ def extract_book(book):
 
     html, fetched_at = fetch_page(
         product_url,
-        cache_path
+        cache_path,
+        stats
     )
 
     soup = BeautifulSoup(html, "html.parser")
@@ -225,21 +272,53 @@ def validate_records(raw_records):
     return valid_records, errors
 
 def main():
-    books = discover_books()
+    start_time = utc_now()
+    start_clock = time.perf_counter()
+
+    stats = {
+        "pages_fetched": 0,
+        "cache_hits": 0,
+    }
+
+    books = discover_books(stats)
+
+    # Deliberately broken URL for the Stage 5 failure test
+    books.append({
+        "product_url": (
+            "https://books.toscrape.com/catalogue/"
+            "this-book-does-not-exist-999999/index.html"
+        ),
+        "source_page": START_URL,
+    })
 
     raw_records = []
+    fetch_errors = []
 
     for book in books:
-        record = extract_book(book)
-        raw_records.append(record)
+        try:
+            record = extract_book(book, stats)
+            raw_records.append(record)
 
-    valid_records, errors = validate_records(raw_records)
+        except Exception as error:
+            print(
+                f"SKIPPED: {book['product_url']} — {error}"
+            )
+
+            fetch_errors.append({
+                "product_url": book["product_url"],
+                "reason": str(error),
+            })
+
+    valid_records, validation_errors = validate_records(
+        raw_records
+    )
 
     output_dir = Path("output")
     output_dir.mkdir(exist_ok=True)
 
     books_file = output_dir / "books.json"
     errors_file = output_dir / "errors.json"
+    report_file = output_dir / "run-report.json"
 
     books_file.write_text(
         json.dumps(
@@ -250,18 +329,42 @@ def main():
         encoding="utf-8"
     )
 
+    all_errors = fetch_errors + validation_errors
+
     errors_file.write_text(
         json.dumps(
-            errors,
+            all_errors,
             indent=2,
             ensure_ascii=False
         ),
         encoding="utf-8"
     )
 
+    duration = time.perf_counter() - start_clock
+
+    report = {
+        "start_time": start_time,
+        "duration_seconds": round(duration, 2),
+        "pages_fetched": stats["pages_fetched"],
+        "cache_hits": stats["cache_hits"],
+        "valid_records": len(valid_records),
+        "invalid_records": len(validation_errors),
+        "failed_pages": len(fetch_errors),
+    }
+
+    report_file.write_text(
+        json.dumps(
+            report,
+            indent=2
+        ),
+        encoding="utf-8"
+    )
+
     print()
     print(f"valid_records={len(valid_records)}")
-    print(f"invalid_records={len(errors)}")
+    print(f"invalid_records={len(validation_errors)}")
+    print(f"failed_pages={len(fetch_errors)}")
     print(f"books_saved={len(valid_records)}")
+    
 if __name__ == "__main__":
     main()

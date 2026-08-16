@@ -1,1 +1,6 @@
-[]
+[
+  {
+    "product_url": "https://books.toscrape.com/catalogue/this-book-does-not-exist-999999/index.html",
+    "reason": "HTTP 404: https://books.toscrape.com/catalogue/this-book-does-not-exist-999999/index.html"
+  }
+]
